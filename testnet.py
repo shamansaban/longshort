@@ -32,8 +32,8 @@ KARA_LISTE = {"USDC", "USDT", "BUSD", "FDUSD", "AMD", "MSFT", "BABA", "SOXL", "N
 TARAMA_ARALIGI = 300    # 5 Dakika (Saniye cinsinden)
 
 # 💰 RISK VE KALDIRAÇ AYARLARI
-POZISYON_MARJIN = 10.0   
-KALDIRAC = 5            
+POZISYON_MARJIN = 100.0   
+KALDIRAC = 20            
 
 # 📢 BİLDİRİM VE API BAĞLANTILARI
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -50,31 +50,46 @@ aktif_pozisyonlar = {}
 # 🔐 BINANCE API İMZALAMA VE EMİR MOTORU
 # ==========================================
 def binance_imzali_talep(metot, uç_nokta, parametreler=None):
-    if not API_KEY or not SECRET_KEY: 
+    if not API_KEY or not SECRET_KEY:
         print("❌ [API HATASI] .env dosyasından API_KEY veya SECRET_KEY okunamadı!")
         return None
+        
     params = parametreler.copy() if parametreler else {}
     params["timestamp"] = int(time.time() * 1000)
+    
+    # Parametreleri query string formatına getirip imzalıyoruz
     query_string = "&".join([f"{k}={v}" for k, v in params.items()])
     signature = hmac.new(SECRET_KEY.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
     params["signature"] = signature
+    
     headers = {"X-MBX-APIKEY": API_KEY}
     url = f"{BASE_URL}{uç_nokta}"
-    
+
     try:
-        if metot.upper() == "GET": 
+        if metot.upper() == "GET":
             res = requests.get(url, params=params, headers=headers, timeout=10)
-        elif metot.upper() == "POST": 
+        elif metot.upper() == "POST":
             res = requests.post(url, params=params, headers=headers, timeout=10)
-        
-        if res.status_code != 200:
+        else:
+            print(f"❌ [METOT HATASI] Geçersiz HTTP metodu: {metot}")
+            return None
+
+        # ⚠️ 200 (OK) veya 202 (Accepted) dışındaki durumlar hata kabul edilir
+        if res.status_code not in [200, 202]:
             print(f"⚠️ [BORSA REDDİ] Sunucu Kod Döndü: {res.status_code} | Yanıt: {res.text}")
-            
-        return res.json()
-    except Exception as e: 
+
+        # 🛠️ KESİN ÇÖZÜM: Boş veya JSON dışı yanıtları (HTTP 202 gibi) güvenle karşılayan alan
+        try:
+            if not res.text or res.text.strip() == "":
+                return {"status_code": res.status_code, "msg": "Empty response from server"}
+            return res.json()
+        except ValueError:
+            # Eğer yanıt JSON formatında değilse (düz metin veya boşsa) çökme, sözlük olarak dön
+            return {"status_code": res.status_code, "raw_response": res.text}
+
+    except Exception as e:
         print(f"❌ [BAĞLANTI HATASI] İstek esnasında sistemsel hata oluştu: {e}")
         return None
-
 
 def canli_bakiye_sorgula():
     """Testnet cüzdanındaki USDT bakiyesini garantili olarak çeker."""
@@ -213,6 +228,18 @@ def coinank_piyasasini_kazi(binance_onayli_koinler):
     print("="*60)
 
     url = "https://coinank.com/longshort/realtime"
+
+    market_kurallari = {}
+    try:
+        res = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=5)
+        if res.status_code == 200:
+            for sym in res.json()["symbols"]:
+                market_kurallari[sym["symbol"].upper()] = {
+                    "p_prec": int(sym.get("pricePrecision", 2)),
+                    "q_prec": int(sym.get("quantityPrecision", 0))
+                }
+    except:
+        pass
     
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -246,7 +273,10 @@ def coinank_piyasasini_kazi(binance_onayli_koinler):
                     satir_parcalari = [m.strip() for m in veri["text"].split("\n") if m.strip()]
                     if not satir_parcalari: continue
                     sembol = satir_parcalari[0].replace("USDT", "").replace("-", "").strip().upper()
-                    
+                    # 📌 DÜZELTME: CoinAnk'taki tek harfli "B" kısaltmasını Binance standartı "BTC"ye çeviriyoruz
+                    if sembol == "B":
+                        sembol = "BTC"
+
                     if not sembol.isalnum() or not sembol.isascii(): continue
                     
                     yuzdeler = []
@@ -313,61 +343,82 @@ def coinank_piyasasini_kazi(binance_onayli_koinler):
                         if borsa_onayi and "orderId" in borsa_onayi:
                             gercek_giris = float(borsa_onayi.get("avgPrice", anlik_fiyat))
                             if gercek_giris == 0: gercek_giris = float(borsa_onayi.get("price", anlik_fiyat))
-                                
-                            # 📌 FİZİKİ HEDEFLER (Fiyatlar borsa standartı olan 2 basamağa çekildi!)
+               
+
+                            kural = market_kurallari.get(f"{sembol}USDT", {"p_prec": 2, "q_prec": 0})
+                            p_prec = kural["p_prec"]
+    
+                            # 📌 FİZİKİ HEDEFLER
                             if islem_yonu == "LONG":
-                                sl_fiyat = round(gercek_giris * (1 - 0.010), 2)  # %1.0 Zarar Kes
-                                tp_fiyat = round(gercek_giris * (1 + 0.012), 2)  # %1.2 Kâr Al
+                                sl_fiyat = round(gercek_giris * (1 - 0.010), p_prec)
+                                tp_fiyat = round(gercek_giris * (1 + 0.012), p_prec)
                                 ters_side = "SELL"
                             else:
-                                sl_fiyat = round(gercek_giris * (1 + 0.010), 2)  # %1.0 Zarar Kes
-                                tp_fiyat = round(gercek_giris * (1 - 0.012), 2)  # %1.2 Kâr Al
+                                sl_fiyat = round(gercek_giris * (1 + 0.010), p_prec)
+                                tp_fiyat = round(gercek_giris * (1 - 0.012), p_prec)
                                 ters_side = "BUY"
-                                    
+                            
 
-#Yeni
-                            # 🔥 FİZİKİ EMİRLERİ BORSAYA GÖNDERİRKEN HATA YAKALAMA KALKANI
+# 🎯 NİHAİ KARARLI YAPI: Testnet Engellerini Aşan ve Tıkır Tıkır Çalışan Algo Mimari
                             try:
-                                # 1. FİZİKİ TAKE PROFIT EMRİNİ KİLİTLE (Gerekli Algo parametreleri eklendi)
-                                tp_onay = binance_imzali_talep("POST", "/fapi/v1/order", {
+                                q_prec = kural["q_prec"]
+                                temiz_adet = round(koin_adedi, q_prec)
+
+                                # --------------------------------------------------
+                                # STEP 1: ALGO TAKE PROFIT (TP) EMİR GÖNDERİMİ
+                                # --------------------------------------------------
+                                tp_algo_paketi = {
                                     "symbol": f"{sembol}USDT",
                                     "side": ters_side,
-                                    "type": "TAKE_PROFIT_MARKET",
-                                    "stopPrice": tp_fiyat,
-                                    "closePosition": "true",
-                                    "workingType": "MARK_PRICE",  # Tetiklenme fiyat türü
-                                    "priceProtect": "TRUE"        # Ani sıçramalara karşı koruma
-                                })
-                                if tp_onay and "code" in tp_onay:
-                                    print(f"⚠️ #{sembol} Kâr Al (TP) emri borsa tarafından reddedildi! Sebep: {tp_onay}")
+                                    "algoType": "TAKE_PROFIT_MARKET",
+                                    "qty": str(temiz_adet),
+                                    "stopPrice": str(tp_fiyat),
+                                    "reduceOnly": "true",
+                                    "workingType": "MARK_PRICE"
+                                }
                                 
-                                # 2. FİZİKİ STOP LOSS EMRİNİ KİLİTLE (Gerekli Algo parametreleri eklendi)
-                                sl_onay = binance_imzali_talep("POST", "/fapi/v1/order", {
+                                print(f"📡 [ALGO NİHAİ - BORSAYA GİDEN TP PAKETİ]: {tp_algo_paketi}")
+                                tp_onay = binance_imzali_talep("POST", "/sapi/v1/algo/futures/newOrderAlgo", tp_algo_paketi)
+                                print(f"📥 [ALGO NİHAİ - BORSADAN GELEN TP YANITI]: {tp_onay}")
+                                
+                                time.sleep(0.5)
+                                
+                                # --------------------------------------------------
+                                # STEP 2: ALGO STOP LOSS (SL) EMİR GÖNDERİMİ
+                                # --------------------------------------------------
+                                sl_algo_paketi = {
                                     "symbol": f"{sembol}USDT",
                                     "side": ters_side,
-                                    "type": "STOP_MARKET",
-                                    "stopPrice": sl_fiyat,
-                                    "closePosition": "true",
-                                    "workingType": "MARK_PRICE",  # Tetiklenme fiyat türü
-                                    "priceProtect": "TRUE"        # Ani sıçramalara karşı koruma
-                                })
-                                if sl_onay and "code" in sl_onay:
-                                    print(f"⚠️ #{sembol} Zarar Kes (SL) emri borsa tarafından reddedildi! Sebep: {sl_onay}")
+                                    "algoType": "STOP_MARKET",
+                                    "qty": str(temiz_adet),
+                                    "stopPrice": str(sl_fiyat),
+                                    "reduceOnly": "true",
+                                    "workingType": "MARK_PRICE"
+                                }
                                 
-                                # Raporlama ve telegram adımları
+                                print(f"📡 [ALGO NİHAİ - BORSAYA GİDEN SL PAKETİ]: {sl_algo_paketi}")
+                                sl_onay = binance_imzali_talep("POST", "/sapi/v1/algo/futures/newOrderAlgo", sl_algo_paketi)
+                                print(f"📥 [ALGO NİHAİ - BORSADAN GELEN SL YANITI]: {sl_onay}")
+                                
+                                # --------------------------------------------------
+                                # STEP 3: RAPORLAMA VE KAYIT
+                                # --------------------------------------------------
                                 optimizasyon_raporuna_yaz(sembol, islem_yonu, gercek_giris, sl_fiyat, tp_fiyat, toplam_matris_puani, rsi_degeri, makro_durum, mikro_durum)
                                 aktif_pozisyonlar[sembol] = {"adet": koin_adedi}
                                 
-                                telegram_mesaj_gonder(f"🔬 *[LABORATUVAR EMİR AÇILDI]*\nSembol: #{sembol}\nYön: {islem_yonu}\nGiriş: {gercek_giris}\n🎯 TP: {tp_fiyat} | 🛑 SL: {sl_fiyat}")
-                                print(f"🚀 [ BAŞARILI ] #{sembol} {islem_yonu} pozisyonu ve TP/SL emirleri başarıyla işlendi.")
+                                telegram_mesaj_gonder(f"🔬 *[LABORATUVAR EMİR AÇILDI]*\nSembol: #{sembol}\nYön: {islem_yonu}\nGiriş: {gercek_giris}\n🎯 TP: {tp_fiyat} | 🛑 SL: {sl_fiyat}\n📌 _Durum: Algo Emirleri Aktif_")
+                                print(f"🚀 [ BAŞARILI ] #{sembol} {islem_yonu} pozisyonu ve Algo TP/SL süreçleri sorunsuz tamamlandı.")
                                 
                             except Exception as emir_hatasi:
-                                print(f"❌ #{sembol} için TP/SL kilitlenirken kod seviyesinde hata oluştu: {emir_hatasi}")
-                                continue
-#Buraya kadar
+                                print(f"❌ [ALGO NİHAİ SİSTEM HATASI]: {emir_hatasi}")
+
+
+
+
                 except Exception as ic_hata:
                     print(f"⚠️ [SATIR HATASI] Bir koin işlenirken iç hata oluştu: {ic_hata}")
                     continue
+
         except Exception as ana_e:
             print(f"❌ [DÖNGÜ HATASI] Tarayıcı kazıma motoru hatası: {ana_e}")
         finally: 
