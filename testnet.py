@@ -324,26 +324,32 @@ def coinank_piyasasini_kazi(binance_onayli_koinler):
                                 tp_fiyat = round(gercek_giris * (1 - 0.012), 2)  # %1.2 Kâr Al
                                 ters_side = "BUY"
                                     
+
+#Yeni
                             # 🔥 FİZİKİ EMİRLERİ BORSAYA GÖNDERİRKEN HATA YAKALAMA KALKANI
                             try:
-                                # 1. FİZİKİ TAKE PROFIT EMRİNİ KİLİTLE
+                                # 1. FİZİKİ TAKE PROFIT EMRİNİ KİLİTLE (Gerekli Algo parametreleri eklendi)
                                 tp_onay = binance_imzali_talep("POST", "/fapi/v1/order", {
                                     "symbol": f"{sembol}USDT",
                                     "side": ters_side,
                                     "type": "TAKE_PROFIT_MARKET",
                                     "stopPrice": tp_fiyat,
-                                    "closePosition": "true"
+                                    "closePosition": "true",
+                                    "workingType": "MARK_PRICE",  # Tetiklenme fiyat türü
+                                    "priceProtect": "TRUE"        # Ani sıçramalara karşı koruma
                                 })
                                 if tp_onay and "code" in tp_onay:
                                     print(f"⚠️ #{sembol} Kâr Al (TP) emri borsa tarafından reddedildi! Sebep: {tp_onay}")
                                 
-                                # 2. FİZİKİ STOP LOSS EMRİNİ KİLİTLE
+                                # 2. FİZİKİ STOP LOSS EMRİNİ KİLİTLE (Gerekli Algo parametreleri eklendi)
                                 sl_onay = binance_imzali_talep("POST", "/fapi/v1/order", {
                                     "symbol": f"{sembol}USDT",
                                     "side": ters_side,
                                     "type": "STOP_MARKET",
                                     "stopPrice": sl_fiyat,
-                                    "closePosition": "true"
+                                    "closePosition": "true",
+                                    "workingType": "MARK_PRICE",  # Tetiklenme fiyat türü
+                                    "priceProtect": "TRUE"        # Ani sıçramalara karşı koruma
                                 })
                                 if sl_onay and "code" in sl_onay:
                                     print(f"⚠️ #{sembol} Zarar Kes (SL) emri borsa tarafından reddedildi! Sebep: {sl_onay}")
@@ -358,6 +364,7 @@ def coinank_piyasasini_kazi(binance_onayli_koinler):
                             except Exception as emir_hatasi:
                                 print(f"❌ #{sembol} için TP/SL kilitlenirken kod seviyesinde hata oluştu: {emir_hatasi}")
                                 continue
+#Buraya kadar
                 except Exception as ic_hata:
                     print(f"⚠️ [SATIR HATASI] Bir koin işlenirken iç hata oluştu: {ic_hata}")
                     continue
