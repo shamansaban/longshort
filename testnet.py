@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 import requests
 from playwright.sync_api import sync_playwright
+import traceback
 
 # 🔇 Asyncio ve Playwright içsel çalkantı uyarılarını terminalde susturur
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
@@ -33,7 +34,7 @@ TARAMA_ARALIGI = 300    # 5 Dakika (Saniye cinsinden)
 
 # 💰 RISK VE KALDIRAÇ AYARLARI
 POZISYON_MARJIN = 100.0   
-KALDIRAC = 20            
+KALDIRAC = 5            
 
 # 📢 BİLDİRİM VE API BAĞLANTILARI
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -153,29 +154,49 @@ def market_mikro_trend_oku():
         return "LONG" if kapanış >= açılış else "SHORT"
     except: return "NOTR"
 
-def binance_rsi_hesapla(sembol, periyot=14):
+# ==========================================
+# 📊 VERİ ANALİZİ İÇİN İNDİKATÖR MOTORLARI (DÜZELTİLDİ)
+# ==========================================
+import requests
+import numpy as np
+import talib  # Kurumsal indikatör kütüphanesi
+
+def binance_rsi_hesapla(sembol, periyot=14, zaman_dilimi="1h"):
     try:
         url = "https://fapi.binance.com/fapi/v1/klines"
-        res = requests.get(url, params={"symbol": f"{sembol}USDT", "interval": "5m", "limit": periyot + 30}, timeout=5)
-        if res.status_code != 200: return 50.0
-        kapanislar = [float(mum[4]) for mum in res.json()]
-        if len(kapanislar) < periyot: return 50.0
+        guncel_sembol = sembol if sembol.endswith("USDT") else f"{sembol}USDT"
         
-        kayiplar, kazanclar = [], []
-        for i in range(1, len(kapanislar)):
-            fark = kapanislar[i] - kapanislar[i-1]
-            kazanclar.append(fark if fark > 0 else 0)
-            kayiplar.append(abs(fark) if fark < 0 else 0)
+        # TA-Lib'in ilk ortalamayı sağlıklı kurması için en az 100-150 mum çekmek şarttır
+        res = requests.get(url, params={"symbol": guncel_sembol, "interval": zaman_dilimi, "limit": 150}, timeout=5)
+        
+        if res.status_code != 200:
+            return 50.0
             
-        ort_kazanc = sum(kazanclar[:periyot]) / periyot
-        ort_kayip = sum(kayiplar[:periyot]) / periyot
-        for i in range(periyot, len(kazanclar)):
-            ort_kazanc = (ort_kazanc * (periyot - 1) + kazanclar[i]) / periyot
-            ort_kayip = (ort_kayip * (periyot - 1) + kayiplar[i]) / periyot
+        ham_veri = res.json()
+        
+        # Kapanış fiyatlarını bir numpy dizisine (float64) çeviriyoruz (TA-Lib bunu şart koşar)
+        kapanislar = np.array([float(mum[4]) for mum in ham_veri], dtype=np.float64)
+        
+        if len(kapanislar) < periyot:
+            return 50.0
             
-        if ort_kayip == 0: return 100.0
-        return round(100 - (100 / (100 + (ort_kazanc / ort_kayip))), 2)
-    except: return 50.0
+        # --- TEK SATIRDA TA-LIB MUCİZESİ ---
+        # TA-Lib arka planda Wilder'ın orijinal RSI (RMA) formülünü C hızında hatasız çalıştırır
+        rsi_serisi = talib.RSI(kapanislar, timeperiod=periyot)
+        
+        # En son canlı mumun RSI değerini alıyoruz
+        hesaplanan_rsi = round(rsi_serisi[-1], 2)
+        
+        # Eğer veri eksi veya geçersiz (NaN) çıkarsa koruma mekanizması
+        if np.isnan(hesaplanan_rsi):
+            hesaplanan_rsi = 50.0
+            
+        print(f"📊 #{guncel_sembol} [{zaman_dilimi}] TA-Lib Gerçek RSI: {hesaplanan_rsi}")
+        return hesaplanan_rsi
+
+    except Exception as e:
+        print(f"⚠️ TA-Lib RSI Hatası: {e}")
+        return 50.0
 
 # ==========================================
 # 📢 TELEGRAM VE LABORATUVAR RAPORLAMA MOTORU
@@ -186,14 +207,19 @@ def telegram_mesaj_gonder(mesaj):
     try: requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": mesaj, "parse_mode": "Markdown"}, timeout=5)
     except: pass
 
-def optimizasyon_raporuna_yaz(sembol, yon, giris, sl, tp, matris_puan, rsi, makro, mikro):
+# ==========================================
+# 📢 OPTİMİZASYON VE GEÇMİŞE DÖNÜK ANALİZ MOTORU (GELİŞTİRİLDİ)
+# ==========================================
+def optimizasyon_raporuna_yaz(sembol, yon, giris, sl, tp, matris_puan, rsi, makro, mikro, sonuc="AÇIK"):
+    """Geriye dönük ağırlık yüzdesi hesaplamaya uygun ML formatında loglama yapar."""
     dosya_adi = "backtest_raporu.csv"
     dosya_exists = os.path.isfile(dosya_adi)
     with open(dosya_adi, mode="a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if not dosya_exists:
-            writer.writerow(["Zaman", "Sembol", "Yön", "Giriş Fiyatı", "Hedef SL", "Hedef TP", "Matris Skoru", "O Anki RSI", "BTC Makro Hacim", "BTC Mikro Trend"])
-        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), sembol, yon, giris, sl, tp, matris_puan, rsi, makro, mikro])
+            # Yapay zeka analizi ve excel korelasyonu için başlıkları optimize ettik
+            writer.writerow(["Zaman", "Sembol", "Yön", "Giriş_Fiyatı", "Hedef_SL", "Hedef_TP", "Matris_Skoru", "Saf_RSI", "BTC_Makro_Hacim", "BTC_Mikro_Trend", "Sonuç"])
+        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), sembol, yon, giris, sl, tp, matris_puan, rsi, makro, mikro, sonuc])
 
 # ==========================================
 # 🔄 HAFIZA SENKRONİZASYON MOTORU
@@ -301,7 +327,7 @@ def coinank_piyasasini_kazi(binance_onayli_koinler):
                     log_on_taki = f"🔍 [İNCELEME] #{sembol:<7} -> 30m[L:%{l_30m:.1f} S:%{s_30m:.1f}] | 1h[L:%{l_1h:.1f} S:%{s_1h:.1f}]"
                     
                     if not is_alarm:
-                        print(f"{log_on_taki} -> [X] Sinyal Eşiği Yetersiz.")
+                        #print(f"{log_on_taki} -> [X] Sinyal Eşiği Yetersiz.")
                         continue
                     
                     zaten_acik = sembol in aktif_pozisyonlar
@@ -335,7 +361,11 @@ def coinank_piyasasini_kazi(binance_onayli_koinler):
                     
                     if anlik_fiyat and canli_bakiye >= POZISYON_MARJIN:
                         koin_adedi = (POZISYON_MARJIN * KALDIRAC) / anlik_fiyat
-                        canli_kaldirac_ayarla(sembol, KALDIRAC)
+                        # Kaldıraç ayarlama adımını esnek hale getiriyoruz
+                        try:
+                            canli_kaldirac_ayarla(sembol, KALDIRAC)
+                        except Exception as lev_e:
+                            print(f"⚠️ [KALDIRAÇ UYARISI] #{sembol} için {KALDIRAC}x uygulanamadı, borsa sınırı kullanılacak: {lev_e}")
                         
                         # Ana Emri Gönder
                         borsa_onayi = canli_market_emri_gonder(sembol, islem_yonu, koin_adedi)
@@ -358,63 +388,72 @@ def coinank_piyasasini_kazi(binance_onayli_koinler):
                                 tp_fiyat = round(gercek_giris * (1 - 0.012), p_prec)
                                 ters_side = "BUY"
                             
-
-# 🎯 NİHAİ KARARLI YAPI: Testnet Engellerini Aşan ve Tıkır Tıkır Çalışan Algo Mimari
                             try:
                                 q_prec = kural["q_prec"]
                                 temiz_adet = round(koin_adedi, q_prec)
 
                                 # --------------------------------------------------
-                                # STEP 1: ALGO TAKE PROFIT (TP) EMİR GÖNDERİMİ
+                                # STEP 1: TAKE PROFIT (TP) - TESTNET ALGO SÜRÜMÜ
                                 # --------------------------------------------------
                                 tp_algo_paketi = {
                                     "symbol": f"{sembol}USDT",
-                                    "side": ters_side,
+                                    "side": str(ters_side),
                                     "algoType": "TAKE_PROFIT_MARKET",
                                     "qty": str(temiz_adet),
                                     "stopPrice": str(tp_fiyat),
                                     "reduceOnly": "true",
                                     "workingType": "MARK_PRICE"
                                 }
-                                
-                                print(f"📡 [ALGO NİHAİ - BORSAYA GİDEN TP PAKETİ]: {tp_algo_paketi}")
+                                print(f"📡 [BORSAYA GİDEN TP PAKETİ]: {tp_algo_paketi}")
                                 tp_onay = binance_imzali_talep("POST", "/sapi/v1/algo/futures/newOrderAlgo", tp_algo_paketi)
-                                print(f"📥 [ALGO NİHAİ - BORSADAN GELEN TP YANITI]: {tp_onay}")
+                                print(f"📥 [BORSADAN GELEN TP YANITI]: {tp_onay}")
                                 
-                                time.sleep(0.5)
+                                time.sleep(0.2)
                                 
                                 # --------------------------------------------------
-                                # STEP 2: ALGO STOP LOSS (SL) EMİR GÖNDERİMİ
+                                # STEP 2: STOP LOSS (SL) - TESTNET ALGO SÜRÜMÜ
                                 # --------------------------------------------------
                                 sl_algo_paketi = {
                                     "symbol": f"{sembol}USDT",
-                                    "side": ters_side,
+                                    "side": str(ters_side),
                                     "algoType": "STOP_MARKET",
                                     "qty": str(temiz_adet),
                                     "stopPrice": str(sl_fiyat),
                                     "reduceOnly": "true",
                                     "workingType": "MARK_PRICE"
                                 }
-                                
-                                print(f"📡 [ALGO NİHAİ - BORSAYA GİDEN SL PAKETİ]: {sl_algo_paketi}")
+                                print(f"📡 [BORSAYA GİDEN SL PAKETİ]: {sl_algo_paketi}")
                                 sl_onay = binance_imzali_talep("POST", "/sapi/v1/algo/futures/newOrderAlgo", sl_algo_paketi)
-                                print(f"📥 [ALGO NİHAİ - BORSADAN GELEN SL YANITI]: {sl_onay}")
+                                print(f"📥 [BORSADAN GELEN SL YANITI]: {sl_onay}")
+
                                 
                                 # --------------------------------------------------
                                 # STEP 3: RAPORLAMA VE KAYIT
                                 # --------------------------------------------------
-                                optimizasyon_raporuna_yaz(sembol, islem_yonu, gercek_giris, sl_fiyat, tp_fiyat, toplam_matris_puani, rsi_degeri, makro_durum, mikro_durum)
+                                borsadan_gelen_saf_rsi = binance_rsi_hesapla(sembol)
+                                print(f"borsadan gelen saf rsi : {borsadan_gelen_saf_rsi}")
+                                optimizasyon_raporuna_yaz(
+                                         sembol, 
+                                         islem_yonu, 
+                                         gercek_giris, 
+                                         sl_fiyat, 
+                                         tp_fiyat, 
+                                         toplam_matris_puani, 
+                                         borsadan_gelen_saf_rsi, 
+                                         makro_durum, 
+                                         mikro_durum)
                                 aktif_pozisyonlar[sembol] = {"adet": koin_adedi}
                                 
                                 telegram_mesaj_gonder(f"🔬 *[LABORATUVAR EMİR AÇILDI]*\nSembol: #{sembol}\nYön: {islem_yonu}\nGiriş: {gercek_giris}\n🎯 TP: {tp_fiyat} | 🛑 SL: {sl_fiyat}\n📌 _Durum: Algo Emirleri Aktif_")
                                 print(f"🚀 [ BAŞARILI ] #{sembol} {islem_yonu} pozisyonu ve Algo TP/SL süreçleri sorunsuz tamamlandı.")
-                                
                             except Exception as emir_hatasi:
-                                print(f"❌ [ALGO NİHAİ SİSTEM HATASI]: {emir_hatasi}")
+                                print("❌ [ALGO NİHAİ SİSTEM HATASI]:", str(emir_hatasi))
+                                print("🔍 --- HATANIN GELDİĞİ YER (DETAYLI SATIR ANALİZİ) ---")
+                                # İşte bu komut hatanın tam satır numarasını ve kodunu basar:
+                                traceback.print_exc() 
+                                print("-----------------------------------------------------")
 
-
-
-
+                                
                 except Exception as ic_hata:
                     print(f"⚠️ [SATIR HATASI] Bir koin işlenirken iç hata oluştu: {ic_hata}")
                     continue
@@ -425,12 +464,19 @@ def coinank_piyasasini_kazi(binance_onayli_koinler):
             browser.close()
             print("="*60 + "\n")
 
+# ==========================================
+# 🌐 VADELİ KOİN FİLTRE MOTORU (KORUMALAR KALDIRILDI)
+# ==========================================
 def binance_vadeli_koinleri_getir():
+    """Binance üzerindeki gerçek AKTİF tüm USDT vadeli koinleri kayıpsız çeker."""
     try:
         res = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=5)
         if res.status_code == 200:
-            return {sym["baseAsset"].upper() for sym in res.json()["symbols"] if sym.get("status") == "TRADING" and sym.get("symbol", "").endswith("USDT") and sym.get("underlyingType") == "COIN"}
-    except: return set()
+            # underlyingType kısıtlaması kaldırıldı, artık tüm altcoinleri yakalayabilir.
+            return {sym["baseAsset"].upper() for sym in res.json()["symbols"] if sym.get("status") == "TRADING" and sym.get("symbol", "").endswith("USDT")}
+    except Exception as e:
+        print(f"❌ Vadeli koin listesi çekilemedi: {e}")
+        return set()
 
 def binance_canli_fiyat_al(sembol):
     try:
