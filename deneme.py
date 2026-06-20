@@ -1,8 +1,7 @@
 # --- API BİLGİLERİ ---
 # Testnet kullanıyorsanız Testnet anahtarlarını ve URL'sini, 
 # Gerçek hesapta deneyecekseniz gerçek anahtarları ve URL'yi yazın.
-API_KEY = "yUNqCSm5gVcd8cmk7AG5FBEJzkSg80wkwLPLA4BQtIhRu82KfG8vGkMvEnxBkZKh"
-SECRET_KEY = "HjFc7HbtyswLcubWL1m6cAaMv2gvioiYhrFch5saAoLrZw6ApQ7nqLaC2GStHASK"
+
 
 import time
 from binance import Client
